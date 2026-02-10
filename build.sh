@@ -39,7 +39,7 @@ rm "$BUILD_DIR/FleetDesktop-arm64" "$BUILD_DIR/FleetDesktop-x86_64"
 # Copy Info.plist
 cp "$SRC_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 
-# Copy app icon and Fleet logo into Resources
+# Copy app icon into Resources
 mkdir -p "$CONTENTS_DIR/Resources"
 cp "$SRC_DIR/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
 

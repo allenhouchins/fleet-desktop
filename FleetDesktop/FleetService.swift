@@ -29,6 +29,11 @@ final class FleetService {
             return
         }
 
+        guard fleetURL.lowercased().hasPrefix("https://") else {
+            showError("Fleet URL must use HTTPS. Found: \(fleetURL)")
+            return
+        }
+
         let baseURL = fleetURL.hasSuffix("/") ? String(fleetURL.dropLast()) : fleetURL
 
         guard let token = readToken(),

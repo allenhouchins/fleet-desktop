@@ -1,15 +1,14 @@
 # Fleet Desktop
 
-Fleet Desktop is a native macOS application that provides end users with a self-service portal for [Fleet](https://fleetdm.com). It integrates with Fleet's [orbit](https://fleetdm.com/docs/get-started/anatomy#orbit) agent to give users direct access to device management features without needing to open a browser.
+Fleet Desktop is a lightweight native macOS app that opens the [Fleet](https://fleetdm.com) self-service portal in the user's default browser. It reads the Fleet URL and device token from [orbit](https://fleetdm.com/docs/get-started/anatomy#orbit) configuration files and launches the appropriate self-service URL.
 
 ## Features
 
 - **Native macOS app** built with Swift and AppKit
 - **Universal binary** supporting Apple Silicon (arm64) and Intel (x86_64)
-- **Self-service portal** embedded in a native window via WKWebView
-- **Automatic token refresh** handles hourly token rotation transparently
-- **File download support** for `.mobileconfig` profiles and other files served by Fleet
-- **Dark/light mode** respects the user's system appearance
+- **Browser launcher** — reads Fleet config and opens the self-service portal in the user's default browser
+- **URL scheme handler** — registers the `fleet://` URL scheme so other apps can trigger it
+- **Error alerts** — displays a native alert if the Fleet URL or device token can't be found
 - **Code signed and notarized** for secure distribution via `.pkg` installer
 
 ## Requirements
@@ -36,32 +35,11 @@ Upload the `.pkg` to Fleet as a software installer. Fleet Desktop will appear in
 ## How It Works
 
 1. **Reads the Fleet URL** from managed preferences or the orbit LaunchDaemon plist (see [Configuration Sources](#configuration-sources))
-2. **Reads the device token** from `/opt/orbit/identifier` (managed by orbit, rotates hourly)
-3. **Opens the self-service portal** at `{FleetURL}/device/{token}/self-service` in an embedded browser window
+2. **Reads the device token** from `/opt/orbit/identifier` (managed by orbit)
+3. **Opens the self-service portal** at `{FleetURL}/device/{token}/self-service` in the user's default browser
+4. **Quits immediately** after opening the URL (or after displaying an error)
 
-### Token Rotation
-
-The device token in `/opt/orbit/identifier` rotates every hour. Fleet Desktop handles this automatically:
-
-- A background timer checks the identifier file every 60 seconds (paused when the window is closed)
-- On HTTP 401/403 errors or error page detection, the app immediately checks for a new token and retries (up to 3 attempts with 5-second delays)
-- Token refreshes are invisible to the user — the page silently reloads with the new token
-
-### File Downloads
-
-When Fleet serves downloadable content (e.g., MDM enrollment profiles):
-
-- `.mobileconfig` files are downloaded and automatically opened for installation
-- All other file types (`.pkg`, `.dmg`, `.zip`, etc.) are saved to `~/Downloads`
-
-### Security
-
-- App Transport Security (ATS) is enforced — only HTTPS connections are allowed
-- External links are restricted to `https`, `http`, and `mailto` schemes
-- Device tokens are percent-encoded and not exposed in error messages
-- Downloaded files are only auto-opened if they are `.mobileconfig` profiles
-- The WebView uses a non-persistent data store (no cookies or cache persist between sessions)
-- Mutable state is protected by a serial dispatch queue for thread safety
+The app also registers a `fleet://` URL scheme. When launched via a URL event, it performs the same steps — opens the self-service portal and quits.
 
 ## Development
 
@@ -70,8 +48,8 @@ When Fleet serves downloadable content (e.g., MDM enrollment profiles):
 ```
 fleet-desktop/
 ├── FleetDesktop/
-│   ├── FleetDesktopApp.swift   # App delegate, main menu, entry point
-│   ├── FleetService.swift      # Config reading, token management, browser launch
+│   ├── FleetDesktopApp.swift   # App delegate, main entry point, URL scheme handler
+│   ├── FleetService.swift      # Config reading, token reading, browser launch
 │   ├── Info.plist              # App bundle metadata
 │   └── AppIcon.icns            # App icon
 ├── build.sh                    # Compiles universal binary
@@ -112,7 +90,7 @@ The Fleet URL is resolved in the following order (first match wins):
 
 | File | Purpose |
 |------|---------|
-| `/opt/orbit/identifier` | Device authentication token (rotates hourly) |
+| `/opt/orbit/identifier` | Device authentication token |
 
 ## CI/CD
 
