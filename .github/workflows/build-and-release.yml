@@ -1,0 +1,243 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      
+      - name: Build app and create pkg
+        id: build
+        run: |
+          chmod +x build-pkg.sh
+          ./build-pkg.sh
+        continue-on-error: false
+      
+      - name: Import Developer ID Application Certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          rm certificate.p12
+      
+      - name: Code Sign App
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Find the Developer ID Application certificate
+          CERT_NAME=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | cut -d'"' -f2)
+          
+          if [ -z "$CERT_NAME" ]; then
+            echo "Error: Developer ID Application certificate not found"
+            security find-identity -v -p codesigning
+            exit 1
+          fi
+          
+          echo "Signing with certificate: $CERT_NAME"
+          
+          # Sign the binary directly first (required for universal binaries)
+          BINARY_PATH="build/Fleet Desktop.app/Contents/MacOS/FleetDesktop"
+          echo "Signing binary: $BINARY_PATH"
+          codesign --force --sign "$CERT_NAME" \
+            --options runtime \
+            --timestamp \
+            "$BINARY_PATH"
+          
+          # Verify binary signature
+          codesign --verify --verbose "$BINARY_PATH" || exit 1
+          
+          # Now sign the app bundle (without --deep since we already signed the binary)
+          echo "Signing app bundle..."
+          codesign --force --sign "$CERT_NAME" \
+            --options runtime \
+            --timestamp \
+            "build/Fleet Desktop.app"
+          
+          # Verify the app bundle signature
+          codesign --verify --verbose "build/Fleet Desktop.app" || exit 1
+          codesign --display --verbose=4 "build/Fleet Desktop.app"
+          
+          # Check hardened runtime is enabled
+          codesign --display --entitlements - "build/Fleet Desktop.app" || echo "No entitlements (this is OK)"
+      
+      - name: Verify app signature before packaging
+        run: |
+          # Verify the app is properly signed
+          codesign --verify --deep --strict --verbose=2 "build/Fleet Desktop.app" || exit 1
+          codesign --display --verbose=2 "build/Fleet Desktop.app"
+          echo "App signature verified successfully"
+      
+      - name: Rebuild pkg with signed app
+        run: |
+          chmod +x build-pkg.sh
+          ./build-pkg.sh
+      
+      - name: Import Developer ID Installer Certificate
+        env:
+          APPLE_INSTALLER_CERTIFICATE_BASE64: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_BASE64 }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_INSTALLER_CERTIFICATE_BASE64" | base64 --decode > installer_certificate.p12
+          security import installer_certificate.p12 -k build.keychain -P "$APPLE_INSTALLER_CERTIFICATE_PASSWORD" -T /usr/bin/productsign
+          rm installer_certificate.p12
+      
+      - name: Sign pkg
+        run: |
+          # Find the Developer ID Installer certificate
+          # Installer certificates aren't returned by codesigning filter, so search all identities
+          # Also search in the build keychain specifically
+          INSTALLER_CERT=$(security find-identity -v build.keychain 2>/dev/null | grep "Developer ID Installer" | head -1 | cut -d'"' -f2)
+          
+          # Fallback: search all keychains
+          if [ -z "$INSTALLER_CERT" ]; then
+            INSTALLER_CERT=$(security find-identity -v | grep "Developer ID Installer" | head -1 | cut -d'"' -f2)
+          fi
+          
+          if [ -z "$INSTALLER_CERT" ]; then
+            echo "Error: Developer ID Installer certificate not found"
+            echo "Available identities in build.keychain:"
+            security find-identity -v build.keychain 2>/dev/null || echo "Build keychain not found"
+            echo "Available identities in all keychains:"
+            security find-identity -v
+            exit 1
+          fi
+          
+          echo "Found installer certificate: $INSTALLER_CERT"
+          
+          # Ensure keychain is unlocked and accessible
+          security unlock-keychain -p "" build.keychain
+          security set-key-partition-list -S apple-tool:,apple:,productsign: -s -k "" build.keychain
+          
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "FleetDesktop/Info.plist")
+          UNSIGNED_PKG="build/dist/fleet_desktop-v${VERSION}.pkg"
+          SIGNED_PKG="build/dist/fleet_desktop-v${VERSION}-signed.pkg"
+          
+          # Verify pkg exists
+          if [ ! -f "$UNSIGNED_PKG" ]; then
+            echo "Error: Package file not found: $UNSIGNED_PKG"
+            ls -la build/dist/ || echo "build/dist directory does not exist"
+            exit 1
+          fi
+          
+          echo "Signing package: $UNSIGNED_PKG"
+          echo "Output will be: $SIGNED_PKG"
+          
+          productsign --sign "$INSTALLER_CERT" \
+            --timestamp \
+            "$UNSIGNED_PKG" \
+            "$SIGNED_PKG"
+          
+          # Replace unsigned with signed
+          mv "$SIGNED_PKG" "$UNSIGNED_PKG"
+          
+          # Verify the signature
+          pkgutil --check-signature "$UNSIGNED_PKG"
+      
+      - name: Notarize pkg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "FleetDesktop/Info.plist")
+          PKG_PATH="build/dist/fleet_desktop-v${VERSION}.pkg"
+          
+          # Submit for notarization and capture submission ID
+          echo "Submitting package for notarization..."
+          SUBMISSION_OUTPUT=$(xcrun notarytool submit "$PKG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m 2>&1) || NOTARIZATION_FAILED=true
+          
+          # Extract submission ID from output
+          SUBMISSION_ID=$(echo "$SUBMISSION_OUTPUT" | grep -i "id:" | head -1 | awk '{print $2}' | tr -d ',' || echo "")
+          
+          echo "$SUBMISSION_OUTPUT"
+          
+          # If notarization failed, get detailed logs
+          if [ "${NOTARIZATION_FAILED:-false}" = "true" ] || echo "$SUBMISSION_OUTPUT" | grep -qi "Invalid\|failed\|error"; then
+            echo "::error::Notarization failed!"
+            if [ -n "$SUBMISSION_ID" ]; then
+              echo "Fetching detailed notarization log for submission: $SUBMISSION_ID"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || echo "Could not fetch log"
+            fi
+            exit 1
+          fi
+          
+          # Staple the notarization ticket
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple "$PKG_PATH"
+          
+          # Verify notarization
+          echo "Validating notarization..."
+          xcrun stapler validate "$PKG_PATH"
+          spctl --assess --type install --verbose "$PKG_PATH"
+      
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "FleetDesktop/Info.plist")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Release $TAG already exists — skipping release creation."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          security delete-keychain build.keychain || true
+      
+      - name: Create Release
+        if: steps.check_release.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Fleet Desktop ${{ steps.version.outputs.version }}
+          body: |
+            ## Fleet Desktop ${{ steps.version.outputs.version }}
+            
+            ### Installation
+            Download and install the `.pkg` file to install Fleet Desktop to `/Applications`.
+            
+            The installer will:
+            - Install Fleet Desktop to `/Applications`
+            - Set ownership to root:admin
+            - Set permissions to 755
+            - On upgrades, gracefully quit and relaunch the app if it was running
+          files: ./build/dist/fleet_desktop-v${{ steps.version.outputs.version }}.pkg
+          draft: false
+          prerelease: false
