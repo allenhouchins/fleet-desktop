@@ -1,14 +1,16 @@
 # Fleet Desktop
 
-Fleet Desktop is a lightweight native macOS app that opens the [Fleet](https://fleetdm.com) self-service portal in the user's default browser. It reads the Fleet URL and device token from [orbit](https://fleetdm.com/docs/get-started/anatomy#orbit) configuration files and launches the appropriate self-service URL.
+Fleet Desktop is a native macOS application that provides end users with a self-service portal for [Fleet](https://fleetdm.com). It integrates with Fleet's [orbit](https://fleetdm.com/docs/get-started/anatomy#orbit) agent to give users direct access to device management features without needing to open a browser.
 
 ## Features
 
 - **Native macOS app** built with Swift and AppKit
 - **Universal binary** supporting Apple Silicon (arm64) and Intel (x86_64)
-- **Browser launcher** — reads Fleet config and opens the self-service portal in the user's default browser
-- **URL scheme handler** — registers the `fleet://` URL scheme so other apps can trigger it
-- **Error alerts** — displays a native alert if the Fleet URL or device token can't be found
+- **Self-service portal** embedded in a native window via WKWebView
+- **Automatic token refresh** handles hourly token rotation transparently
+- **Loading screen** with Fleet logo while the portal loads
+- **File download support** for `.mobileconfig` profiles and other files served by Fleet
+- **Dark/light mode** respects the user's system appearance
 - **Code signed and notarized** for secure distribution via `.pkg` installer
 
 ## Requirements
@@ -35,11 +37,32 @@ Upload the `.pkg` to Fleet as a software installer. Fleet Desktop will appear in
 ## How It Works
 
 1. **Reads the Fleet URL** from managed preferences or the orbit LaunchDaemon plist (see [Configuration Sources](#configuration-sources))
-2. **Reads the device token** from `/opt/orbit/identifier` (managed by orbit)
-3. **Opens the self-service portal** at `{FleetURL}/device/{token}/self-service` in the user's default browser
-4. **Quits immediately** after opening the URL (or after displaying an error)
+2. **Reads the device token** from `/opt/orbit/identifier` (managed by orbit, rotates hourly)
+3. **Opens the self-service portal** at `{FleetURL}/device/{token}/self-service` in an embedded browser window
 
-The app also registers a `fleet://` URL scheme. When launched via a URL event, it performs the same steps — opens the self-service portal and quits.
+### Token Rotation
+
+The device token in `/opt/orbit/identifier` rotates every hour. Fleet Desktop handles this automatically:
+
+- A background timer checks the identifier file every 60 seconds (paused when the window is closed)
+- On HTTP 401/403 errors or error page detection, the app immediately checks for a new token and retries (up to 3 attempts with 5-second delays)
+- Token refreshes are invisible to the user — the page silently reloads with the new token
+
+### File Downloads
+
+When Fleet serves downloadable content (e.g., MDM enrollment profiles):
+
+- `.mobileconfig` files are downloaded and automatically opened for installation
+- All other file types (`.pkg`, `.dmg`, `.zip`, etc.) are saved to `~/Downloads`
+
+### Security
+
+- App Transport Security (ATS) is enforced — only HTTPS connections are allowed
+- External links are restricted to `https`, `http`, and `mailto` schemes
+- Device tokens are percent-encoded and not exposed in error messages
+- Downloaded files are only auto-opened if they are `.mobileconfig` profiles
+- The WebView uses a non-persistent data store (no cookies or cache persist between sessions)
+- Mutable state is protected by a serial dispatch queue for thread safety
 
 ## Development
 
@@ -48,10 +71,12 @@ The app also registers a `fleet://` URL scheme. When launched via a URL event, i
 ```
 fleet-desktop/
 ├── FleetDesktop/
-│   ├── FleetDesktopApp.swift   # App delegate, main entry point, URL scheme handler
-│   ├── FleetService.swift      # Config reading, token reading, browser launch
+│   ├── FleetDesktopApp.swift   # App delegate, main menu, entry point
+│   ├── FleetService.swift      # Config reading, token management, refresh timer
+│   ├── BrowserWindow.swift     # WKWebView window, loading overlay, downloads
 │   ├── Info.plist              # App bundle metadata
-│   └── AppIcon.icns            # App icon
+│   ├── AppIcon.icns            # App icon
+│   └── fleet-logo.png          # Fleet logo for loading screen
 ├── build.sh                    # Compiles universal binary
 ├── build-pkg.sh                # Creates signed .pkg installer
 ├── LICENSE                     # MIT License
@@ -90,7 +115,7 @@ The Fleet URL is resolved in the following order (first match wins):
 
 | File | Purpose |
 |------|---------|
-| `/opt/orbit/identifier` | Device authentication token |
+| `/opt/orbit/identifier` | Device authentication token (rotates hourly) |
 
 ## CI/CD
 
@@ -98,18 +123,18 @@ There are two GitHub Actions workflows:
 
 ### Build (`.github/workflows/build.yml`)
 
-Runs automatically on every push and on pull requests (doc-only changes are skipped).
+Runs automatically on every push to `main` and on pull requests (doc-only changes are skipped). This lets contributors verify and test their changes.
 
 1. Compiles a universal binary (arm64 + x86_64)
 2. Code signs the app with a Developer ID Application certificate
-3. Packages into a `.pkg` installer
+3. Packages into a `.pkg` installer with a custom distribution XML
 4. Signs the `.pkg` with a Developer ID Installer certificate
 5. Notarizes with Apple and staples the ticket
 6. Uploads the signed `.pkg` as a workflow artifact (retained for 30 days)
 
 ### Build and Release (`.github/workflows/build-and-release.yml`)
 
-Manually triggered via `workflow_dispatch`. Performs all the same build, sign, and notarize steps as the Build workflow, then creates a GitHub Release with the `.pkg` attached. Skips release creation if the version tag already exists.
+Manually triggered via `workflow_dispatch`. Performs all the same build, sign, and notarize steps as the Build workflow, then creates a GitHub Release with the `.pkg` attached.
 
 ### Required GitHub Secrets
 
@@ -127,7 +152,7 @@ Manually triggered via `workflow_dispatch`. Performs all the same build, sign, a
 
 1. Update `CFBundleShortVersionString` in `FleetDesktop/Info.plist`
 2. Push to `main` (the Build workflow will run automatically to verify the build)
-3. Go to **Actions > Build and Release > Run workflow** to create a GitHub Release
+3. Go to **Actions → Build and Release → Run workflow** to create a GitHub Release
 
 ## Contributing
 

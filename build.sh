@@ -15,6 +15,7 @@ mkdir -p "$MACOS_DIR"
 
 SOURCES=(
     "$SRC_DIR/FleetService.swift"
+    "$SRC_DIR/BrowserWindow.swift"
     "$SRC_DIR/FleetDesktopApp.swift"
 )
 SDK="$(xcrun --show-sdk-path)"
@@ -39,9 +40,12 @@ rm "$BUILD_DIR/FleetDesktop-arm64" "$BUILD_DIR/FleetDesktop-x86_64"
 # Copy Info.plist
 cp "$SRC_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 
-# Copy app icon into Resources
+# Copy app icon and Fleet logo into Resources
 mkdir -p "$CONTENTS_DIR/Resources"
 cp "$SRC_DIR/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
+if [ -f "$SRC_DIR/fleet-logo.png" ]; then
+    cp "$SRC_DIR/fleet-logo.png" "$CONTENTS_DIR/Resources/fleet-logo.png"
+fi
 
 echo "Build complete: $APP_DIR"
 echo "Run with: open \"$APP_DIR\""

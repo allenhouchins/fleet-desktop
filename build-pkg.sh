@@ -56,7 +56,7 @@ if osascript -e "application id \"$BUNDLE_ID\" is running" 2>/dev/null | grep -q
 
     # Wait up to 10 seconds for the process to exit
     for i in $(seq 1 10); do
-        if ! pgrep -x "FleetDesktop" >/dev/null 2>&1; then
+        if ! pgrep -f "$BUNDLE_ID" >/dev/null 2>&1 && ! pgrep -x "FleetDesktop" >/dev/null 2>&1; then
             break
         fi
         sleep 1
