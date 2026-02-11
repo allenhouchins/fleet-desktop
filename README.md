@@ -11,13 +11,15 @@ Fleet Desktop is a native macOS application that provides end users with a self-
 - **Loading screen** with Fleet logo while the portal loads
 - **File download support** for `.mobileconfig` profiles and other files served by Fleet
 - **Dark/light mode** respects the user's system appearance
+- **`fleet://` URL scheme** for deep linking to Self-service, Policies, and triggering refetches
+- **MDM required** — both the app and installer enforce MDM enrollment
 - **Code signed and notarized** for secure distribution via `.pkg` installer
 
 ## Requirements
 
 - macOS 13.0 (Ventura) or later
+- MDM-enabled Mac with Fleet's managed preferences profile installed
 - Fleet's orbit agent installed and enrolled
-- The Fleet URL must be available via managed preferences (MDM) or the orbit LaunchDaemon plist
 - The orbit identifier file must exist at `/opt/orbit/identifier`
 
 ## Installation
@@ -28,7 +30,7 @@ Fleet Desktop is a native macOS application that provides end users with a self-
 2. Double-click the `.pkg` file to run the installer
 3. Follow the installation wizard
 
-The installer places the app in `/Applications` with `root:admin` ownership and `755` permissions. On upgrades, the installer gracefully quits Fleet Desktop before installing and automatically relaunches it afterward.
+The installer requires an MDM-enabled Mac. It checks for the Fleet managed preferences profile before proceeding — if the profile is not found, the installer will display an error and abort. The app is placed in `/Applications` with `root:admin` ownership and `755` permissions. On upgrades, the installer gracefully quits Fleet Desktop before installing and automatically relaunches it afterward.
 
 ### Via Fleet (Software)
 
@@ -36,7 +38,7 @@ Upload the `.pkg` to Fleet as a software installer. Fleet Desktop will appear in
 
 ## How It Works
 
-1. **Reads the Fleet URL** from managed preferences or the orbit LaunchDaemon plist (see [Configuration Sources](#configuration-sources))
+1. **Reads the Fleet URL** from MDM managed preferences (see [Configuration Sources](#configuration-sources))
 2. **Reads the device token** from `/opt/orbit/identifier` (managed by orbit, rotates hourly)
 3. **Opens the self-service portal** at `{FleetURL}/device/{token}/self-service` in an embedded browser window
 
@@ -106,16 +108,30 @@ open "build/Fleet Desktop.app"
 
 ### Configuration Sources
 
-The Fleet URL is resolved in the following order (first match wins):
+| File | Key | Purpose |
+|------|-----|---------|
+| `/Library/Managed Preferences/com.fleetdm.fleetd.config.plist` | `FleetURL` | Fleet server URL (delivered via MDM profile) |
+| `/opt/orbit/identifier` | — | Device authentication token (rotates hourly) |
 
-| Priority | File | Key | Scenario |
-|----------|------|-----|----------|
-| 1 | `/Library/Managed Preferences/com.fleetdm.fleetd.config.plist` | `FleetURL` | MDM-managed machines |
-| 2 | `/Library/LaunchDaemons/com.fleetdm.orbit.plist` | `EnvironmentVariables > ORBIT_FLEET_URL` | Non-MDM machines |
+> **Note:** Fleet Desktop only supports MDM-enabled Macs. If the managed preferences file is not present, the app displays an error and the installer will refuse to proceed.
 
-| File | Purpose |
-|------|---------|
-| `/opt/orbit/identifier` | Device authentication token (rotates hourly) |
+### URL Scheme
+
+Fleet Desktop registers the `fleet://` URL scheme, allowing other tools and scripts to open specific pages:
+
+| URL | Action |
+|-----|--------|
+| `fleet://self-service` | Opens the Self-service tab |
+| `fleet://policies` | Opens the Policies tab |
+| `fleet://refetch` | Triggers a device refetch and opens the app |
+| `fleet://anything-else` | Brings the app to the foreground |
+
+Example usage from a script or terminal:
+
+```bash
+open fleet://self-service
+open fleet://refetch
+```
 
 ## CI/CD
 

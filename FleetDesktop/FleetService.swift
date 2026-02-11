@@ -1,8 +1,9 @@
 import Foundation
 import AppKit
 
-/// Core service that reads the Fleet URL and device token from orbit,
-/// then opens the self-service portal in a browser window.
+/// Core service that reads the Fleet URL from MDM managed preferences and
+/// the device token from orbit, then opens the self-service portal in a
+/// browser window. Only MDM-managed machines are supported.
 ///
 /// The WebView is kept alive when the window is closed, so reopening is instant.
 /// The token is checked every 60 seconds (timer paused when the window is closed)
@@ -16,7 +17,8 @@ final class FleetService {
     private let stateQueue = DispatchQueue(label: "com.fleetdm.fleet-desktop.state")
 
     /// The base Fleet URL (set once during setup, never changes afterward).
-    private var baseURL: String?
+    /// Access only from stateQueue.
+    private var _baseURL: String?
 
     /// Current device token (rotates hourly). Access only from stateQueue.
     private var _currentToken: String?
@@ -41,10 +43,12 @@ final class FleetService {
     private var _retryCount = 0
 
     /// Page requested via fleet:// URL before setup completed. Consumed by setup().
-    private var pendingPage: String?
+    /// Access only from stateQueue.
+    private var _pendingPage: String?
 
     /// Whether a refetch was requested via fleet://refetch before setup completed.
-    private var pendingRefetch = false
+    /// Access only from stateQueue.
+    private var _pendingRefetch = false
 
     /// Characters to trim from file contents (leading/trailing only).
     private static let trimCharacters = CharacterSet(charactersIn: "\n\r ")
@@ -102,10 +106,11 @@ final class FleetService {
 
         // fleet://refetch — fire the refetch POST and bring the app forward
         if host == "refetch" {
-            if baseURL != nil {
+            let hasConfig: Bool = stateQueue.sync { _baseURL != nil }
+            if hasConfig {
                 performRefetch()
             } else {
-                pendingRefetch = true
+                stateQueue.sync { _pendingRefetch = true }
             }
             run()
             return
@@ -132,15 +137,15 @@ final class FleetService {
         }
 
         // Not yet set up — store the requested page (if valid) and run setup
-        pendingPage = page
+        stateQueue.sync { _pendingPage = page }
         run()
     }
 
     /// Sends a POST to the Fleet refetch API endpoint for this device.
     /// Runs asynchronously; failures are logged but not surfaced to the user.
     private func performRefetch() {
-        let token: String? = stateQueue.sync { _currentToken }
-        guard let baseURL = baseURL,
+        let (base, token): (String?, String?) = stateQueue.sync { (_baseURL, _currentToken) }
+        guard let baseURL = base,
               let tok = token,
               let encoded = tok.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: "\(baseURL)/api/v1/fleet/device/\(encoded)/refetch") else {
@@ -166,13 +171,14 @@ final class FleetService {
     /// The token is percent-encoded to handle any special characters safely.
     /// Defaults to "self-service" if no page is specified.
     private func deviceURL(page: String = "self-service") -> URL? {
-        let token: String? = stateQueue.sync { _currentToken }
-        guard let baseURL = baseURL,
+        let (base, token): (String?, String?) = stateQueue.sync { (_baseURL, _currentToken) }
+        guard let baseURL = base,
               let tok = token,
               let encoded = tok.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
             return nil
         }
-        return URL(string: "\(baseURL)/device/\(encoded)/\(page)")
+        let encodedPage = page.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? page
+        return URL(string: "\(baseURL)/device/\(encoded)/\(encodedPage)")
     }
 
     /// Reads config, creates the BrowserWindow, loads the URL, shows the window,
@@ -182,10 +188,14 @@ final class FleetService {
             stateQueue.sync { _isSettingUp = false }
             return
         }
-        let page = pendingPage ?? "self-service"
-        pendingPage = nil
-        if pendingRefetch {
-            pendingRefetch = false
+        let (page, shouldRefetch): (String, Bool) = stateQueue.sync {
+            let p = _pendingPage ?? "self-service"
+            _pendingPage = nil
+            let r = _pendingRefetch
+            _pendingRefetch = false
+            return (p, r)
+        }
+        if shouldRefetch {
             performRefetch()
         }
         guard let url = deviceURL(page: page) else {
@@ -224,7 +234,7 @@ final class FleetService {
             return false
         }
 
-        baseURL = fleetURL.hasSuffix("/") ? String(fleetURL.dropLast()) : fleetURL
+        stateQueue.sync { _baseURL = fleetURL.hasSuffix("/") ? String(fleetURL.dropLast()) : fleetURL }
 
         guard let token = readToken() else {
             showError("Device token not found or could not be read at \(tokenFile).\nEnsure orbit is enrolled and the identifier file exists.")

@@ -460,7 +460,7 @@ extension BrowserWindow: WKDownloadDelegate {
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        NSLog("Fleet Desktop: Download failed: \(error.localizedDescription)")
+        NSLog("Fleet Desktop: Download failed: %@", error.localizedDescription)
     }
 }
 
