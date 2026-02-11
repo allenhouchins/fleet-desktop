@@ -95,7 +95,7 @@ final class FleetService {
 
     /// Pages that can be opened via fleet:// URLs.
     /// Unrecognized URLs simply bring the app to the foreground.
-    private static let validPages: Set<String> = ["self-service", "policies"]
+    private static let validPages: Set<String> = ["self-service", "policies", "software"]
 
     /// Handles an incoming fleet:// URL by navigating to the corresponding page.
     /// e.g. fleet://self-service → self-service tab, fleet://policies → policies tab.

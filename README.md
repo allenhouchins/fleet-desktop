@@ -122,6 +122,7 @@ Fleet Desktop registers the `fleet://` URL scheme, allowing other tools and scri
 | URL | Action |
 |-----|--------|
 | `fleet://self-service` | Opens the Self-service tab |
+| `fleet://software` | Opens the Software tab |
 | `fleet://policies` | Opens the Policies tab |
 | `fleet://refetch` | Triggers a device refetch and opens the app |
 | `fleet://anything-else` | Brings the app to the foreground |
