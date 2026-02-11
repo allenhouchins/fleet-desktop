@@ -26,7 +26,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             andEventID: AEEventID(kAEGetURL)
         )
 
-        fleetService.run()
+        // Defer run() to the next run loop iteration so that any pending
+        // fleet:// URL event is delivered first. When macOS launches the app
+        // via a URL, the Apple Event arrives on the same run loop pass as
+        // applicationDidFinishLaunching — deferring ensures handleFleetURL()
+        // sets pendingPage/pendingRefetch before setup() reads them.
+        DispatchQueue.main.async { [weak self] in
+            self?.fleetService.run()
+        }
     }
 
     @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {
