@@ -40,14 +40,17 @@ final class FleetService {
     /// Current retry count for navigation-error-triggered refreshes. Access only from stateQueue.
     private var _retryCount = 0
 
+    /// Page requested via fleet:// URL before setup completed. Consumed by setup().
+    private var pendingPage: String?
+
+    /// Whether a refetch was requested via fleet://refetch before setup completed.
+    private var pendingRefetch = false
+
     /// Characters to trim from file contents (leading/trailing only).
     private static let trimCharacters = CharacterSet(charactersIn: "\n\r ")
 
     /// Path to the managed preferences plist (MDM-managed machines).
     private static let managedPrefsPlistPath = "/Library/Managed Preferences/com.fleetdm.fleetd.config.plist"
-
-    /// Path to the orbit LaunchDaemon plist (fallback for non-MDM machines).
-    private static let orbitPlistPath = "/Library/LaunchDaemons/com.fleetdm.orbit.plist"
 
     init() {
         let root = ProcessInfo.processInfo.environment["ORBIT_ROOT_DIR"] ?? "/opt/orbit"
@@ -86,18 +89,90 @@ final class FleetService {
         }
     }
 
+    /// Pages that can be opened via fleet:// URLs.
+    /// Unrecognized URLs simply bring the app to the foreground.
+    private static let validPages: Set<String> = ["self-service", "policies"]
+
+    /// Handles an incoming fleet:// URL by navigating to the corresponding page.
+    /// e.g. fleet://self-service → self-service tab, fleet://policies → policies tab.
+    /// fleet://refetch triggers a device refetch and opens the app.
+    /// Unrecognized URLs just bring the app to the foreground.
+    func handleFleetURL(_ url: URL) {
+        let host = url.host?.lowercased()
+
+        // fleet://refetch — fire the refetch POST and bring the app forward
+        if host == "refetch" {
+            if baseURL != nil {
+                performRefetch()
+            } else {
+                pendingRefetch = true
+            }
+            run()
+            return
+        }
+
+        let page: String? = {
+            guard let host = host, Self.validPages.contains(host) else { return nil }
+            return host
+        }()
+
+        // If the browser is already set up, navigate (or just show) the window
+        if let browser = browserWindow, browser.isAvailable {
+            if let page = page, let target = deviceURL(page: page) {
+                DispatchQueue.main.async {
+                    browser.reload(url: target)
+                    browser.show()
+                }
+            } else {
+                DispatchQueue.main.async {
+                    browser.show()
+                }
+            }
+            return
+        }
+
+        // Not yet set up — store the requested page (if valid) and run setup
+        pendingPage = page
+        run()
+    }
+
+    /// Sends a POST to the Fleet refetch API endpoint for this device.
+    /// Runs asynchronously; failures are logged but not surfaced to the user.
+    private func performRefetch() {
+        let token: String? = stateQueue.sync { _currentToken }
+        guard let baseURL = baseURL,
+              let tok = token,
+              let encoded = tok.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: "\(baseURL)/api/v1/fleet/device/\(encoded)/refetch") else {
+            NSLog("Fleet Desktop: Unable to construct refetch URL")
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                NSLog("Fleet Desktop: Refetch failed: %@", error.localizedDescription)
+                return
+            }
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                NSLog("Fleet Desktop: Refetch returned HTTP %d", http.statusCode)
+            }
+        }.resume()
+    }
+
     // MARK: - Private
 
-    /// Builds the self-service URL from the base URL and current token.
+    /// Builds a device page URL from the base URL, current token, and page name.
     /// The token is percent-encoded to handle any special characters safely.
-    private func selfServiceURL() -> URL? {
+    /// Defaults to "self-service" if no page is specified.
+    private func deviceURL(page: String = "self-service") -> URL? {
         let token: String? = stateQueue.sync { _currentToken }
         guard let baseURL = baseURL,
               let tok = token,
               let encoded = tok.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
             return nil
         }
-        return URL(string: "\(baseURL)/device/\(encoded)/self-service")
+        return URL(string: "\(baseURL)/device/\(encoded)/\(page)")
     }
 
     /// Reads config, creates the BrowserWindow, loads the URL, shows the window,
@@ -107,7 +182,13 @@ final class FleetService {
             stateQueue.sync { _isSettingUp = false }
             return
         }
-        guard let url = selfServiceURL() else {
+        let page = pendingPage ?? "self-service"
+        pendingPage = nil
+        if pendingRefetch {
+            pendingRefetch = false
+            performRefetch()
+        }
+        guard let url = deviceURL(page: page) else {
             stateQueue.sync { _isSettingUp = false }
             showError("Unable to construct self-service URL. Check Fleet configuration.")
             return
@@ -139,7 +220,7 @@ final class FleetService {
     /// Reads the Fleet URL and device token. Returns true if successful.
     private func resolveConfig() -> Bool {
         guard let fleetURL = readFleetURL() else {
-            showError("Fleet URL not found.\n\nChecked:\n• \(Self.managedPrefsPlistPath) (key: FleetURL)\n• \(Self.orbitPlistPath) (key: EnvironmentVariables > ORBIT_FLEET_URL)")
+            showError("This app is currently only supported on MDM-enabled Macs. Please contact your administrator for assistance.")
             return false
         }
 
@@ -181,7 +262,7 @@ final class FleetService {
             return true
         }
         guard changed else { return }
-        guard let url = selfServiceURL() else { return }
+        guard let url = deviceURL() else { return }
 
         DispatchQueue.main.async {
             browser.reload(url: url)
@@ -199,7 +280,7 @@ final class FleetService {
                 _currentToken = newToken
                 _retryCount = 0
             }
-            if let url = selfServiceURL(), let browser = browserWindow {
+            if let url = deviceURL(), let browser = browserWindow {
                 DispatchQueue.main.async { browser.reload(url: url) }
             }
             return
@@ -225,30 +306,11 @@ final class FleetService {
 
     // MARK: - File Reading
 
-    /// Reads the Fleet URL from managed preferences (MDM) first,
-    /// falling back to the orbit LaunchDaemon plist (non-MDM).
+    /// Reads the Fleet URL from managed preferences (MDM).
+    /// Only MDM-managed machines are supported.
     private func readFleetURL() -> String? {
-        // 1. MDM-managed machines: check managed preferences
-        if let url = readManagedPrefsFleetURL() {
-            return url
-        }
-        // 2. Fallback: orbit LaunchDaemon plist
-        return readOrbitPlistFleetURL()
-    }
-
-    private func readManagedPrefsFleetURL() -> String? {
         guard let plist = NSDictionary(contentsOfFile: Self.managedPrefsPlistPath),
               let url = plist["FleetURL"] as? String else {
-            return nil
-        }
-        let trimmed = url.trimmingCharacters(in: Self.trimCharacters)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private func readOrbitPlistFleetURL() -> String? {
-        guard let plist = NSDictionary(contentsOfFile: Self.orbitPlistPath),
-              let envVars = plist["EnvironmentVariables"] as? [String: Any],
-              let url = envVars["ORBIT_FLEET_URL"] as? String else {
             return nil
         }
         let trimmed = url.trimmingCharacters(in: Self.trimCharacters)

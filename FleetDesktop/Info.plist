@@ -22,5 +22,16 @@
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.fleetdm.fleet-desktop.url</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>fleet</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

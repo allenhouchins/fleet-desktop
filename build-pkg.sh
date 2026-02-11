@@ -27,11 +27,19 @@ mkdir -p "$PKG_DIR/Applications"
 # Use ditto to preserve extended attributes and signatures
 ditto "$APP_DIR" "$PKG_DIR/Applications/Fleet Desktop.app"
 
-# Create preinstall script to quit the app if running
+# Create preinstall script to check MDM and quit the app if running
 cat > "$PKG_DIR/preinstall" << 'PREINSTALL_EOF'
 #!/bin/bash
-# Preinstall script: gracefully quit Fleet Desktop if it is running
-# and track its state so postinstall can relaunch it.
+# Preinstall script: verify MDM enrollment, gracefully quit Fleet Desktop
+# if it is running, and track its state so postinstall can relaunch it.
+
+MDM_PLIST="/Library/Managed Preferences/com.fleetdm.fleetd.config.plist"
+if [ ! -f "$MDM_PLIST" ]; then
+    echo "ERROR: Fleet Desktop requires an MDM-enabled Mac." >&2
+    echo "The managed preferences file was not found at: $MDM_PLIST" >&2
+    echo "Please enroll this device via MDM before installing Fleet Desktop." >&2
+    exit 1
+fi
 
 BUNDLE_ID="com.fleetdm.fleet-desktop"
 RUNNING_FLAG="/tmp/.fleet_desktop_was_running"
@@ -131,6 +139,18 @@ cat > "$DIST_XML" << DIST_EOF
 <installer-gui-script minSpecVersion="2">
     <title>Fleet Desktop v${VERSION}</title>
     <options customize="never" require-scripts="false"/>
+    <installation-check script="mdm_check()"/>
+    <script>
+function mdm_check() {
+    if (system.files.fileExistsAtPath('/Library/Managed Preferences/com.fleetdm.fleetd.config.plist')) {
+        return true;
+    }
+    my.result.title = 'Installation Failed';
+    my.result.message = 'Fleet Desktop requires an MDM-enabled Mac. Please enroll this device via MDM before installing Fleet Desktop.';
+    my.result.type = 'Fatal';
+    return false;
+}
+    </script>
     <choices-outline>
         <line choice="default"/>
     </choices-outline>
