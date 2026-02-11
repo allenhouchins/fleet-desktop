@@ -15,25 +15,22 @@ struct FleetDesktopMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let fleetService = FleetService()
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        setupMainMenu()
-
-        // Register handler for fleet:// URLs
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Register handler for fleet:// URLs before the system delivers them.
+        // On a cold launch via URL, macOS delivers the Apple Event between
+        // willFinishLaunching and didFinishLaunching — registering here ensures
+        // the event is captured and pending state is set before run() is called.
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleURLEvent(_:withReply:)),
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL)
         )
+    }
 
-        // Defer run() to the next run loop iteration so that any pending
-        // fleet:// URL event is delivered first. When macOS launches the app
-        // via a URL, the Apple Event arrives on the same run loop pass as
-        // applicationDidFinishLaunching — deferring ensures handleFleetURL()
-        // sets pendingPage/pendingRefetch before setup() reads them.
-        DispatchQueue.main.async { [weak self] in
-            self?.fleetService.run()
-        }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        setupMainMenu()
+        fleetService.run()
     }
 
     @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {

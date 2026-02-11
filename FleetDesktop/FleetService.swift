@@ -188,24 +188,30 @@ final class FleetService {
             stateQueue.sync { _isSettingUp = false }
             return
         }
-        let (page, shouldRefetch): (String, Bool) = stateQueue.sync {
-            let p = _pendingPage ?? "self-service"
-            _pendingPage = nil
-            let r = _pendingRefetch
-            _pendingRefetch = false
-            return (p, r)
-        }
-        if shouldRefetch {
-            performRefetch()
-        }
-        guard let url = deviceURL(page: page) else {
-            stateQueue.sync { _isSettingUp = false }
-            showError("Unable to construct self-service URL. Check Fleet configuration.")
-            return
-        }
 
+        // Consume pending state on the main queue. handleFleetURL() always runs
+        // on the main thread, so by the time this block executes, any fleet://
+        // URL event that triggered the launch will have already set
+        // _pendingPage / _pendingRefetch.
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+
+            let (page, shouldRefetch): (String, Bool) = self.stateQueue.sync {
+                let p = self._pendingPage ?? "self-service"
+                self._pendingPage = nil
+                let r = self._pendingRefetch
+                self._pendingRefetch = false
+                return (p, r)
+            }
+            if shouldRefetch {
+                self.performRefetch()
+            }
+            guard let url = self.deviceURL(page: page) else {
+                self.stateQueue.sync { self._isSettingUp = false }
+                self.showError("Unable to construct self-service URL. Check Fleet configuration.")
+                return
+            }
+
             let browser = BrowserWindow()
             self.browserWindow = browser
 
