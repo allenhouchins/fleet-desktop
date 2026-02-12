@@ -93,6 +93,14 @@ final class FleetService {
         }
     }
 
+    /// Reloads the current page in the browser window (e.g., Cmd+R).
+    func reloadCurrentPage() {
+        guard let browser = browserWindow else { return }
+        DispatchQueue.main.async {
+            browser.reloadCurrent()
+        }
+    }
+
     /// Pages that can be opened via fleet:// URLs.
     /// Unrecognized URLs simply bring the app to the foreground.
     private static let validPages: Set<String> = ["self-service", "policies", "software"]

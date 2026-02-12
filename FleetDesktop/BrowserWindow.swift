@@ -143,6 +143,11 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
         return webView != nil
     }
 
+    /// Reload the current page in the web view (e.g., Cmd+R).
+    func reloadCurrent() {
+        webView?.reload()
+    }
+
     /// Navigate the existing web view to a new URL (e.g., after token refresh).
     func reload(url: URL) {
         fleetHost = url.host
