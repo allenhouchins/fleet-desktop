@@ -117,6 +117,7 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
         )
         win.title = title
         win.isReleasedWhenClosed = false
+        win.tabbingMode = .disallowed
         win.representedURL = nil
         win.standardWindowButton(.documentIconButton)?.isHidden = true
         win.contentView = container
