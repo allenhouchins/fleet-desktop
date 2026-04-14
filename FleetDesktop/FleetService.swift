@@ -30,11 +30,23 @@ final class FleetService {
     /// Timer that periodically checks for token rotation.
     private var refreshTimer: Timer?
 
+    /// GCD timer that polls the desktop API for badge data.
+    /// Uses DispatchSourceTimer so it fires even when the window is closed.
+    private var badgeTimer: DispatchSourceTimer?
+
+    /// Whether the badge timer is currently suspended. Access only from stateQueue.
+    /// Tracked to keep suspend/resume calls balanced (required by DispatchSourceTimer).
+    private var _badgeTimerSuspended = false
+
     /// How often (in seconds) to check for a new token.
     private static let tokenRefreshInterval: TimeInterval = 60
 
     /// Delay before retrying a token refresh after a navigation error.
     private static let tokenRetryDelay: TimeInterval = 5
+
+    /// How often (in seconds) to poll the desktop API for badge data when the window is closed.
+    /// When the window is open, badge data is fetched on the 60-second token refresh timer instead.
+    private static let badgePollInterval: TimeInterval = 300
 
     /// Maximum number of consecutive retry attempts on navigation error.
     private static let maxRetryAttempts = 3
@@ -63,6 +75,10 @@ final class FleetService {
 
     deinit {
         refreshTimer?.invalidate()
+        // DispatchSourceTimer must be resumed before cancellation if suspended.
+        if _badgeTimerSuspended { badgeTimer?.resume() }
+        badgeTimer?.cancel()
+        badgeTimer = nil
     }
 
     // MARK: - Public
@@ -162,13 +178,22 @@ final class FleetService {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             if let error = error {
                 NSLog("Fleet Desktop: Refetch failed: %@", error.localizedDescription)
                 return
             }
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 NSLog("Fleet Desktop: Refetch returned HTTP %d", http.statusCode)
+                return
+            }
+            // Refetch succeeded — poll the badge soon to catch policy changes
+            // (e.g., an app install that causes a policy to pass).
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) {
+                self?.fetchDesktopData()
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) {
+                self?.fetchDesktopData()
             }
         }.resume()
     }
@@ -235,8 +260,8 @@ final class FleetService {
             }
 
             browser.preload(url: url)
-            browser.show()
-            self.startRefreshTimer()
+            self.startBadgePolling()
+            browser.show() // Triggers onWindowShow → startRefreshTimer()
             self.stateQueue.sync { self._isSettingUp = false }
         }
     }
@@ -265,14 +290,17 @@ final class FleetService {
         refreshTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: Self.tokenRefreshInterval, repeats: true) { [weak self] _ in
             self?.refreshTokenIfNeeded()
+            self?.fetchDesktopData()
         }
         timer.tolerance = 5 // Allow system to coalesce for energy efficiency
         refreshTimer = timer
+        suspendBadgePolling()
     }
 
     private func stopRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        resumeBadgePolling()
     }
 
     /// Re-reads the token file. If the token has changed, silently reloads the browser with the new URL.
@@ -325,6 +353,99 @@ final class FleetService {
             guard let self = self else { return }
             // Re-read token; if it changed, refreshTokenIfNeeded will reload
             self.refreshTokenIfNeeded()
+        }
+    }
+
+    // MARK: - Badge Polling
+
+    /// Starts the GCD timer that periodically fetches the failing policy count.
+    /// Called once from setup(), runs for the lifetime of the process.
+    /// When the window is open, the 60-second refreshTimer also fetches badge data,
+    /// so this timer is suspended to avoid duplicate requests.
+    private func startBadgePolling() {
+        // DispatchSourceTimer must be resumed before cancellation if suspended.
+        if _badgeTimerSuspended { badgeTimer?.resume() }
+        badgeTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(
+            deadline: .now(),
+            repeating: Self.badgePollInterval,
+            leeway: .seconds(30)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.fetchDesktopData()
+        }
+        // DispatchSource starts suspended. Only resume if the refreshTimer
+        // isn't already handling badge fetches (browser.show() may have
+        // triggered onWindowShow → startRefreshTimer → suspendBadgePolling
+        // before we get here).
+        let suspended: Bool = stateQueue.sync { _badgeTimerSuspended }
+        if !suspended {
+            timer.resume()
+        }
+        badgeTimer = timer
+    }
+
+    private func suspendBadgePolling() {
+        stateQueue.sync {
+            guard !_badgeTimerSuspended else { return }
+            _badgeTimerSuspended = true
+            badgeTimer?.suspend()
+        }
+    }
+
+    private func resumeBadgePolling() {
+        stateQueue.sync {
+            guard _badgeTimerSuspended else { return }
+            _badgeTimerSuspended = false
+            badgeTimer?.resume()
+        }
+    }
+
+    /// Fetches the desktop API endpoint and updates the Dock badge.
+    private func fetchDesktopData() {
+        let (base, token): (String?, String?) = stateQueue.sync { (_baseURL, _currentToken) }
+        guard let baseURL = base,
+              let tok = token,
+              let encoded = tok.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: "\(baseURL)/api/v1/fleet/device/\(encoded)/desktop") else {
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if let error = error {
+                NSLog("Fleet Desktop: Badge poll failed: %@", error.localizedDescription)
+                return
+            }
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                if http.statusCode != 401 && http.statusCode != 403 {
+                    NSLog("Fleet Desktop: Badge poll returned HTTP %d", http.statusCode)
+                }
+                return
+            }
+            guard let data = data else { return }
+            self?.updateBadge(from: data)
+        }.resume()
+    }
+
+    /// Parses the desktop API response and sets the Dock badge label.
+    private func updateBadge(from data: Data) {
+        struct DesktopResponse: Decodable {
+            let failing_policies_count: Int
+        }
+
+        do {
+            let response = try JSONDecoder().decode(DesktopResponse.self, from: data)
+            let label: String? = response.failing_policies_count > 0
+                ? "\(response.failing_policies_count)"
+                : nil
+            DispatchQueue.main.async {
+                NSApp.dockTile.badgeLabel = label
+            }
+        } catch {
+            NSLog("Fleet Desktop: Failed to decode desktop response: %@", error.localizedDescription)
         }
     }
 
