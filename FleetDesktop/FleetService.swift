@@ -27,26 +27,20 @@ final class FleetService {
     /// Access only from stateQueue.
     private var _isSettingUp = false
 
-    /// Timer that periodically checks for token rotation.
+    /// Timer that periodically checks for token rotation and refreshes the Dock badge.
+    /// Runs for the lifetime of the service (not stopped when the window closes) so the
+    /// badge keeps updating even when the app is Dock-only.
     private var refreshTimer: Timer?
 
-    /// GCD timer that polls the desktop API for badge data.
-    /// Uses DispatchSourceTimer so it fires even when the window is closed.
-    private var badgeTimer: DispatchSourceTimer?
+    /// Activity token that prevents App Nap from throttling the refresh timer when no
+    /// window is visible. Held for the lifetime of the service.
+    private var activityToken: NSObjectProtocol?
 
-    /// Whether the badge timer is currently suspended. Access only from stateQueue.
-    /// Tracked to keep suspend/resume calls balanced (required by DispatchSourceTimer).
-    private var _badgeTimerSuspended = false
-
-    /// How often (in seconds) to check for a new token.
+    /// How often (in seconds) to check for a new token and refresh the badge.
     private static let tokenRefreshInterval: TimeInterval = 60
 
     /// Delay before retrying a token refresh after a navigation error.
     private static let tokenRetryDelay: TimeInterval = 5
-
-    /// How often (in seconds) to poll the desktop API for badge data when the window is closed.
-    /// When the window is open, badge data is fetched on the 60-second token refresh timer instead.
-    private static let badgePollInterval: TimeInterval = 300
 
     /// Maximum number of consecutive retry attempts on navigation error.
     private static let maxRetryAttempts = 3
@@ -75,10 +69,9 @@ final class FleetService {
 
     deinit {
         refreshTimer?.invalidate()
-        // DispatchSourceTimer must be resumed before cancellation if suspended.
-        if _badgeTimerSuspended { badgeTimer?.resume() }
-        badgeTimer?.cancel()
-        badgeTimer = nil
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+        }
     }
 
     // MARK: - Public
@@ -251,17 +244,13 @@ final class FleetService {
             browser.onNavigationError = { [weak self] in
                 self?.handleNavigationError()
             }
-            browser.onWindowClose = { [weak self] in
-                self?.stopRefreshTimer()
-            }
             browser.onWindowShow = { [weak self] in
                 self?.refreshTokenIfNeeded()
-                self?.startRefreshTimer()
             }
 
             browser.preload(url: url)
-            self.startBadgePolling()
-            browser.show() // Triggers onWindowShow → startRefreshTimer()
+            browser.show()
+            self.startRefreshTimer()
             self.stateQueue.sync { self._isSettingUp = false }
         }
     }
@@ -286,6 +275,9 @@ final class FleetService {
 
     // MARK: - Token Refresh
 
+    /// Starts the refresh timer and declares an ongoing activity so App Nap
+    /// doesn't throttle the timer when the window is closed. Called once at
+    /// setup time; the timer runs for the lifetime of the service.
     private func startRefreshTimer() {
         refreshTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: Self.tokenRefreshInterval, repeats: true) { [weak self] _ in
@@ -294,13 +286,19 @@ final class FleetService {
         }
         timer.tolerance = 5 // Allow system to coalesce for energy efficiency
         refreshTimer = timer
-        suspendBadgePolling()
-    }
 
-    private func stopRefreshTimer() {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
-        resumeBadgePolling()
+        // Prevent App Nap so the timer keeps firing (and the Dock badge stays
+        // current) when the window is closed.
+        if activityToken == nil {
+            activityToken = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Fleet Desktop badge polling"
+            )
+        }
+
+        // Fetch the badge count immediately so the first update doesn't wait
+        // for the full 60-second interval.
+        fetchDesktopData()
     }
 
     /// Re-reads the token file. If the token has changed, silently reloads the browser with the new URL.
@@ -357,50 +355,6 @@ final class FleetService {
     }
 
     // MARK: - Badge Polling
-
-    /// Starts the GCD timer that periodically fetches the failing policy count.
-    /// Called once from setup(), runs for the lifetime of the process.
-    /// When the window is open, the 60-second refreshTimer also fetches badge data,
-    /// so this timer is suspended to avoid duplicate requests.
-    private func startBadgePolling() {
-        // DispatchSourceTimer must be resumed before cancellation if suspended.
-        if _badgeTimerSuspended { badgeTimer?.resume() }
-        badgeTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(
-            deadline: .now(),
-            repeating: Self.badgePollInterval,
-            leeway: .seconds(30)
-        )
-        timer.setEventHandler { [weak self] in
-            self?.fetchDesktopData()
-        }
-        // DispatchSource starts suspended. Only resume if the refreshTimer
-        // isn't already handling badge fetches (browser.show() may have
-        // triggered onWindowShow → startRefreshTimer → suspendBadgePolling
-        // before we get here).
-        let suspended: Bool = stateQueue.sync { _badgeTimerSuspended }
-        if !suspended {
-            timer.resume()
-        }
-        badgeTimer = timer
-    }
-
-    private func suspendBadgePolling() {
-        stateQueue.sync {
-            guard !_badgeTimerSuspended else { return }
-            _badgeTimerSuspended = true
-            badgeTimer?.suspend()
-        }
-    }
-
-    private func resumeBadgePolling() {
-        stateQueue.sync {
-            guard _badgeTimerSuspended else { return }
-            _badgeTimerSuspended = false
-            badgeTimer?.resume()
-        }
-    }
 
     /// Fetches the desktop API endpoint and updates the Dock badge.
     private func fetchDesktopData() {
