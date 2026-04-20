@@ -27,10 +27,16 @@ final class FleetService {
     /// Access only from stateQueue.
     private var _isSettingUp = false
 
-    /// Timer that periodically checks for token rotation.
+    /// Timer that periodically checks for token rotation and refreshes the Dock badge.
+    /// Runs for the lifetime of the service (not stopped when the window closes) so the
+    /// badge keeps updating even when the app is Dock-only.
     private var refreshTimer: Timer?
 
-    /// How often (in seconds) to check for a new token.
+    /// Activity token that prevents App Nap from throttling the refresh timer when no
+    /// window is visible. Held for the lifetime of the service.
+    private var activityToken: NSObjectProtocol?
+
+    /// How often (in seconds) to check for a new token and refresh the badge.
     private static let tokenRefreshInterval: TimeInterval = 60
 
     /// Delay before retrying a token refresh after a navigation error.
@@ -63,6 +69,9 @@ final class FleetService {
 
     deinit {
         refreshTimer?.invalidate()
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+        }
     }
 
     // MARK: - Public
@@ -162,13 +171,22 @@ final class FleetService {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             if let error = error {
                 NSLog("Fleet Desktop: Refetch failed: %@", error.localizedDescription)
                 return
             }
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 NSLog("Fleet Desktop: Refetch returned HTTP %d", http.statusCode)
+                return
+            }
+            // Refetch succeeded — poll the badge soon to catch policy changes
+            // (e.g., an app install that causes a policy to pass).
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) {
+                self?.fetchDesktopData()
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) {
+                self?.fetchDesktopData()
             }
         }.resume()
     }
@@ -226,12 +244,8 @@ final class FleetService {
             browser.onNavigationError = { [weak self] in
                 self?.handleNavigationError()
             }
-            browser.onWindowClose = { [weak self] in
-                self?.stopRefreshTimer()
-            }
             browser.onWindowShow = { [weak self] in
                 self?.refreshTokenIfNeeded()
-                self?.startRefreshTimer()
             }
 
             browser.preload(url: url)
@@ -261,18 +275,30 @@ final class FleetService {
 
     // MARK: - Token Refresh
 
+    /// Starts the refresh timer and declares an ongoing activity so App Nap
+    /// doesn't throttle the timer when the window is closed. Called once at
+    /// setup time; the timer runs for the lifetime of the service.
     private func startRefreshTimer() {
         refreshTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: Self.tokenRefreshInterval, repeats: true) { [weak self] _ in
             self?.refreshTokenIfNeeded()
+            self?.fetchDesktopData()
         }
         timer.tolerance = 5 // Allow system to coalesce for energy efficiency
         refreshTimer = timer
-    }
 
-    private func stopRefreshTimer() {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
+        // Prevent App Nap so the timer keeps firing (and the Dock badge stays
+        // current) when the window is closed.
+        if activityToken == nil {
+            activityToken = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Fleet Desktop badge polling"
+            )
+        }
+
+        // Fetch the badge count immediately so the first update doesn't wait
+        // for the full 60-second interval.
+        fetchDesktopData()
     }
 
     /// Re-reads the token file. If the token has changed, silently reloads the browser with the new URL.
@@ -325,6 +351,55 @@ final class FleetService {
             guard let self = self else { return }
             // Re-read token; if it changed, refreshTokenIfNeeded will reload
             self.refreshTokenIfNeeded()
+        }
+    }
+
+    // MARK: - Badge Polling
+
+    /// Fetches the desktop API endpoint and updates the Dock badge.
+    private func fetchDesktopData() {
+        let (base, token): (String?, String?) = stateQueue.sync { (_baseURL, _currentToken) }
+        guard let baseURL = base,
+              let tok = token,
+              let encoded = tok.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: "\(baseURL)/api/v1/fleet/device/\(encoded)/desktop") else {
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if let error = error {
+                NSLog("Fleet Desktop: Badge poll failed: %@", error.localizedDescription)
+                return
+            }
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                if http.statusCode != 401 && http.statusCode != 403 {
+                    NSLog("Fleet Desktop: Badge poll returned HTTP %d", http.statusCode)
+                }
+                return
+            }
+            guard let data = data else { return }
+            self?.updateBadge(from: data)
+        }.resume()
+    }
+
+    /// Parses the desktop API response and sets the Dock badge label.
+    private func updateBadge(from data: Data) {
+        struct DesktopResponse: Decodable {
+            let failing_policies_count: Int
+        }
+
+        do {
+            let response = try JSONDecoder().decode(DesktopResponse.self, from: data)
+            let label: String? = response.failing_policies_count > 0
+                ? "\(response.failing_policies_count)"
+                : nil
+            DispatchQueue.main.async {
+                NSApp.dockTile.badgeLabel = label
+            }
+        } catch {
+            NSLog("Fleet Desktop: Failed to decode desktop response: %@", error.localizedDescription)
         }
     }
 
