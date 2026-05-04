@@ -33,6 +33,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fleetService.run()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        fleetService.onApplicationDidBecomeActive()
+    }
+
     @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {
         guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
               let url = URL(string: urlString),

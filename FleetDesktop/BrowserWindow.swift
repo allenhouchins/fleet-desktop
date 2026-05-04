@@ -144,6 +144,11 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
         return webView != nil
     }
 
+    /// Whether the browser window exists and is on-screen (not used for preloaded-only state).
+    var isWindowVisible: Bool {
+        window.map { $0.isVisible } ?? false
+    }
+
     /// Reload the current page in the web view (e.g., Cmd+R).
     func reloadCurrent() {
         webView?.reload()

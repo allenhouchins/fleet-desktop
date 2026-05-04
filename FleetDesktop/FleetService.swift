@@ -56,6 +56,14 @@ final class FleetService {
     /// Access only from stateQueue.
     private var _pendingRefetch = false
 
+    /// Set when a `fleet://` open needs the browser UI as soon as setup completes (cold launch or still starting).
+    /// Access only from stateQueue.
+    private var _userRequestedFleetUI = false
+
+    /// True after setup if we intentionally skipped the first window show (login item / `open -j`).
+    /// Used to present once when the user foregrounds the app. Main thread only.
+    private var deferredPresentationFromHeadlessLaunch = false
+
     /// Characters to trim from file contents (leading/trailing only).
     private static let trimCharacters = CharacterSet(charactersIn: "\n\r ")
 
@@ -77,12 +85,14 @@ final class FleetService {
     // MARK: - Public
 
     /// Called when the user wants to see the window (app launch, Dock click, etc.).
-    /// On first call, creates the WebView and shows the window.
-    /// On subsequent calls, just brings the existing window forward.
+    /// On first call, creates the WebView; the window is shown unless launch was headless
+    /// (`open -j`, hidden login item) and there was no `fleet://` cold open.
+    /// On subsequent calls, brings the existing window forward.
     func run() {
         // If already set up, just show the window
         if let browser = browserWindow, browser.isAvailable {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                self?.deferredPresentationFromHeadlessLaunch = false
                 browser.show()
             }
             return
@@ -119,6 +129,14 @@ final class FleetService {
     /// fleet://refetch triggers a device refetch and opens the app.
     /// Unrecognized URLs just bring the app to the foreground.
     func handleFleetURL(_ url: URL) {
+        let browserReady: Bool = stateQueue.sync {
+            guard let b = browserWindow else { return false }
+            return b.isAvailable
+        }
+        if !browserReady {
+            stateQueue.sync { _userRequestedFleetUI = true }
+        }
+
         let host = url.host?.lowercased()
 
         // fleet://refetch — fire the refetch POST and bring the app forward
@@ -207,7 +225,7 @@ final class FleetService {
         return URL(string: "\(baseURL)/device/\(encoded)/\(encodedPage)")
     }
 
-    /// Reads config, creates the BrowserWindow, loads the URL, shows the window,
+    /// Reads config, creates the BrowserWindow, loads the URL, optionally shows the window,
     /// and starts the refresh timer.
     private func setup() {
         guard resolveConfig() else {
@@ -249,9 +267,41 @@ final class FleetService {
             }
 
             browser.preload(url: url)
-            browser.show()
             self.startRefreshTimer()
-            self.stateQueue.sync { self._isSettingUp = false }
+
+            // Defer the show decision one turn so `NSApp.isActive` reflects hidden login / `open -j`.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+
+                let userWantsFleetWindow: Bool = self.stateQueue.sync {
+                    let v = self._userRequestedFleetUI
+                    self._userRequestedFleetUI = false
+                    return v
+                }
+                let showNow = NSApp.isActive || userWantsFleetWindow
+                if showNow {
+                    browser.show()
+                    self.deferredPresentationFromHeadlessLaunch = false
+                } else {
+                    self.deferredPresentationFromHeadlessLaunch = true
+                }
+                self.stateQueue.sync { self._isSettingUp = false }
+            }
+        }
+    }
+
+    /// After a headless launch, present the window the first time the user foregrounds the app
+    /// (e.g. Cmd-Tab). Dock clicks use `applicationShouldHandleReopen` → `run()` instead.
+    func onApplicationDidBecomeActive() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            guard self.deferredPresentationFromHeadlessLaunch, NSApp.isActive else { return }
+            guard let browser = self.browserWindow, browser.isAvailable, !browser.isWindowVisible else {
+                self.deferredPresentationFromHeadlessLaunch = false
+                return
+            }
+            browser.show()
+            self.deferredPresentationFromHeadlessLaunch = false
         }
     }
 
