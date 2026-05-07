@@ -138,7 +138,7 @@ cat > "$DIST_XML" << DIST_EOF
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
     <title>Fleet Desktop v${VERSION}</title>
-    <options customize="never" require-scripts="false"/>
+    <options customize="never" require-scripts="false" hostArchitectures="x86_64,arm64"/>
     <installation-check script="mdm_check()"/>
     <script>
 function mdm_check() {
