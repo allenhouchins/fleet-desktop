@@ -64,6 +64,16 @@ final class FleetService {
     /// Used to present once when the user foregrounds the app. Main thread only.
     private var deferredPresentationFromHeadlessLaunch = false
 
+    /// Most recent `failing_policies_count` from the desktop API.
+    /// Access only from stateQueue.
+    private var _lastBadgeCount: Int?
+
+    /// The `failing_policies_count` reflected by the currently loaded web page.
+    /// Compared to `_lastBadgeCount` when the window is shown to detect a stale
+    /// Policies tab (e.g. badge dropped to 0 while the window was closed).
+    /// Access only from stateQueue.
+    private var _pageBadgeCount: Int?
+
     /// Characters to trim from file contents (leading/trailing only).
     private static let trimCharacters = CharacterSet(charactersIn: "\n\r ")
 
@@ -159,6 +169,7 @@ final class FleetService {
         // If the browser is already set up, navigate (or just show) the window
         if let browser = browserWindow, browser.isAvailable {
             if let page = page, let target = deviceURL(page: page) {
+                stateQueue.sync { _pageBadgeCount = _lastBadgeCount }
                 DispatchQueue.main.async {
                     browser.reload(url: target)
                     browser.show()
@@ -264,6 +275,7 @@ final class FleetService {
             }
             browser.onWindowShow = { [weak self] in
                 self?.refreshTokenIfNeeded()
+                self?.reloadIfPoliciesStale()
             }
 
             browser.preload(url: url)
@@ -364,6 +376,7 @@ final class FleetService {
         guard changed else { return }
         guard let url = deviceURL() else { return }
 
+        stateQueue.sync { _pageBadgeCount = _lastBadgeCount }
         DispatchQueue.main.async {
             browser.reload(url: url)
         }
@@ -442,14 +455,38 @@ final class FleetService {
 
         do {
             let response = try JSONDecoder().decode(DesktopResponse.self, from: data)
-            let label: String? = response.failing_policies_count > 0
-                ? "\(response.failing_policies_count)"
-                : nil
+            let count = response.failing_policies_count
+            let label: String? = count > 0 ? "\(count)" : nil
+            stateQueue.sync {
+                _lastBadgeCount = count
+                // On the first successful poll, seed the page-state count too —
+                // the loaded web page reflects Fleet state at this same moment.
+                if _pageBadgeCount == nil {
+                    _pageBadgeCount = count
+                }
+            }
             DispatchQueue.main.async {
                 NSApp.dockTile.badgeLabel = label
             }
         } catch {
             NSLog("Fleet Desktop: Failed to decode desktop response: %@", error.localizedDescription)
+        }
+    }
+
+    /// Reloads the web view when the badge count differs from what the currently
+    /// loaded page is showing — e.g. user closed the window with 1 failing policy,
+    /// the badge later dropped to 0, and they're reopening to see the change.
+    private func reloadIfPoliciesStale() {
+        let (current, rendered): (Int?, Int?) = stateQueue.sync {
+            (_lastBadgeCount, _pageBadgeCount)
+        }
+        guard let current = current,
+              let rendered = rendered,
+              current != rendered,
+              let browser = browserWindow else { return }
+        stateQueue.sync { _pageBadgeCount = current }
+        DispatchQueue.main.async {
+            browser.reloadCurrent()
         }
     }
 
