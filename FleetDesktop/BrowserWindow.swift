@@ -16,6 +16,10 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
     private var loadingOverlay: NSView?
     private var pageLoaded = false
 
+    /// JavaScript to run on the next `didFinish` navigation. Consumed once.
+    /// Used by `fleet://update_all` to click the in-page "Update all" button.
+    private var pendingPostLoadJS: String?
+
     /// Tracks whether an SSO/auth flow is in progress. When true, external IdP
     /// redirects are kept in the WebView so the full redirect chain completes in-app.
     private var ssoFlowActive = false
@@ -161,6 +165,12 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
         webView?.load(URLRequest(url: url))
     }
 
+    /// Queue JavaScript to run once, the next time a navigation finishes loading.
+    /// Set this *before* calling `preload(url:)` or `reload(url:)`.
+    func runOnNextLoad(_ js: String) {
+        pendingPostLoadJS = js
+    }
+
     // MARK: - Loading Overlay
 
     private func addLoadingOverlay() {
@@ -264,6 +274,7 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
         window = nil
         loadingOverlay?.removeFromSuperview()
         loadingOverlay = nil
+        pendingPostLoadJS = nil
         resetSSOFlow()
         onWindowClose?()
     }
@@ -286,6 +297,14 @@ extension BrowserWindow: WKNavigationDelegate {
         // Check if the page content indicates an error (Fleet returns 200 with error HTML
         // when the token is expired, rather than a 401/403 status code)
         checkPageForErrors(webView)
+
+        // Only run queued JS on Fleet-host pages — avoids injecting into IdP
+        // pages during SSO redirects and avoids consuming the slot on an
+        // intermediate redirect before the real target finishes loading.
+        if let js = pendingPostLoadJS, webView.url?.host == fleetHost {
+            pendingPostLoadJS = nil
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
     }
 
     /// Inspects the page DOM for error indicators that suggest the device token has expired.

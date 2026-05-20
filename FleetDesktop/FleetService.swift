@@ -56,6 +56,10 @@ final class FleetService {
     /// Access only from stateQueue.
     private var _pendingRefetch = false
 
+    /// Whether an update-all was requested via fleet://update_all before setup completed.
+    /// Access only from stateQueue.
+    private var _pendingUpdateAll = false
+
     /// Set when a `fleet://` open needs the browser UI as soon as setup completes (cold launch or still starting).
     /// Access only from stateQueue.
     private var _userRequestedFleetUI = false
@@ -161,6 +165,23 @@ final class FleetService {
             return
         }
 
+        // fleet://update_all (or fleet://update-all) — open the self-service page
+        // and click its "Update all" button via the WebView so the install logic
+        // stays defined by Fleet's UI rather than duplicated here.
+        if host == "update_all" || host == "update-all" {
+            let ready: Bool = stateQueue.sync {
+                guard let b = browserWindow else { return false }
+                return b.isAvailable
+            }
+            if ready {
+                triggerUpdateAll()
+            } else {
+                stateQueue.sync { _pendingUpdateAll = true }
+                run()
+            }
+            return
+        }
+
         let page: String? = {
             guard let host = host, Self.validPages.contains(host) else { return nil }
             return host
@@ -220,6 +241,44 @@ final class FleetService {
         }.resume()
     }
 
+    /// Navigates to the self-service page and clicks its "Update all" button,
+    /// reusing the Fleet UI's own filter/install logic. Called when fleet://update_all
+    /// arrives after the browser has been set up.
+    private func triggerUpdateAll() {
+        guard let target = deviceURL(page: "self-service"),
+              let browser = browserWindow else { return }
+        DispatchQueue.main.async {
+            browser.runOnNextLoad(Self.updateAllJS)
+            browser.reload(url: target)
+            browser.show()
+        }
+    }
+
+    /// JS injected into the self-service page to click its "Update all" button.
+    /// Retries for a few seconds because the React UI mounts asynchronously after
+    /// `didFinish`. Matching on visible button text keeps the install logic owned
+    /// by Fleet's UI rather than duplicated in this app.
+    private static let updateAllJS = """
+    (function() {
+        var attempts = 0;
+        var maxAttempts = 60; // ~30s at 500ms
+        function tryClick() {
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var label = (btns[i].textContent || '').trim();
+                if (label === 'Update all' && !btns[i].disabled) {
+                    btns[i].click();
+                    return;
+                }
+            }
+            if (++attempts < maxAttempts) {
+                setTimeout(tryClick, 500);
+            }
+        }
+        tryClick();
+    })();
+    """
+
     // MARK: - Private
 
     /// Builds a device page URL from the base URL, current token, and page name.
@@ -251,16 +310,20 @@ final class FleetService {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
-            let (page, shouldRefetch): (String, Bool) = self.stateQueue.sync {
+            let (requestedPage, shouldRefetch, shouldUpdateAll): (String, Bool, Bool) = self.stateQueue.sync {
                 let p = self._pendingPage ?? "self-service"
                 self._pendingPage = nil
                 let r = self._pendingRefetch
                 self._pendingRefetch = false
-                return (p, r)
+                let u = self._pendingUpdateAll
+                self._pendingUpdateAll = false
+                return (p, r, u)
             }
             if shouldRefetch {
                 self.performRefetch()
             }
+            // Update-all requires the self-service page so the button is in the DOM.
+            let page = shouldUpdateAll ? "self-service" : requestedPage
             guard let url = self.deviceURL(page: page) else {
                 self.stateQueue.sync { self._isSettingUp = false }
                 self.showError("Unable to construct self-service URL. Check Fleet configuration.")
@@ -278,6 +341,9 @@ final class FleetService {
                 self?.reloadIfPoliciesStale()
             }
 
+            if shouldUpdateAll {
+                browser.runOnNextLoad(Self.updateAllJS)
+            }
             browser.preload(url: url)
             self.startRefreshTimer()
 
