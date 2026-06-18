@@ -60,6 +60,14 @@ final class FleetService {
     /// Access only from stateQueue.
     private var _pendingUpdateAll = false
 
+    /// Whether an install-all was requested via fleet://install_all before setup completed.
+    /// Access only from stateQueue.
+    private var _pendingInstallAll = false
+
+    /// Category id (if any) for a pending install-all, from ?category_id=##.
+    /// Access only from stateQueue.
+    private var _pendingInstallAllCategoryId: String?
+
     /// Set when a `fleet://` open needs the browser UI as soon as setup completes (cold launch or still starting).
     /// Access only from stateQueue.
     private var _userRequestedFleetUI = false
@@ -141,6 +149,9 @@ final class FleetService {
     /// Handles an incoming fleet:// URL by navigating to the corresponding page.
     /// e.g. fleet://self-service → self-service tab, fleet://policies → policies tab.
     /// fleet://refetch triggers a device refetch and opens the app.
+    /// fleet://update_all clicks the self-service "Update all" button.
+    /// fleet://install_all clicks the self-service "Install all" button (optionally
+    /// scoped to ?category_id=##).
     /// Unrecognized URLs just bring the app to the foreground.
     func handleFleetURL(_ url: URL) {
         let browserReady: Bool = stateQueue.sync {
@@ -177,6 +188,29 @@ final class FleetService {
                 triggerUpdateAll()
             } else {
                 stateQueue.sync { _pendingUpdateAll = true }
+                run()
+            }
+            return
+        }
+
+        // fleet://install_all (or fleet://install-all) — open the self-service page
+        // and click its "Install all" button, then confirm the modal, via the WebView.
+        // An optional ?category_id=## first filters the page to that category so only
+        // that category's apps are installed, matching Fleet's own UI behavior. As with
+        // update_all, the install logic stays owned by Fleet's UI rather than duplicated.
+        if host == "install_all" || host == "install-all" {
+            let categoryId = Self.categoryID(from: url)
+            let ready: Bool = stateQueue.sync {
+                guard let b = browserWindow else { return false }
+                return b.isAvailable
+            }
+            if ready {
+                triggerInstallAll(categoryId: categoryId)
+            } else {
+                stateQueue.sync {
+                    _pendingInstallAll = true
+                    _pendingInstallAllCategoryId = categoryId
+                }
                 run()
             }
             return
@@ -279,12 +313,85 @@ final class FleetService {
     })();
     """
 
+    /// Extracts and validates the `category_id` query parameter from a fleet:// URL.
+    /// Returns the numeric string when present and well-formed, otherwise nil.
+    /// Validation keeps anything unexpected out of the URL we build (the Fleet UI
+    /// parses category_id as an integer).
+    private static func categoryID(from url: URL) -> String? {
+        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+              let value = items.first(where: { $0.name.lowercased() == "category_id" })?.value,
+              !value.isEmpty,
+              value.allSatisfy({ $0.isNumber }) else {
+            return nil
+        }
+        return value
+    }
+
+    /// Navigates to the self-service page (optionally filtered to a category) and
+    /// clicks its "Install all" button, then confirms the modal — reusing the Fleet
+    /// UI's own filter/install logic. Called when fleet://install_all arrives after
+    /// the browser has been set up.
+    private func triggerInstallAll(categoryId: String?) {
+        guard let target = deviceURL(page: "self-service", categoryId: categoryId),
+              let browser = browserWindow else { return }
+        DispatchQueue.main.async {
+            browser.runOnNextLoad(Self.installAllJS)
+            browser.reload(url: target)
+            browser.show()
+        }
+    }
+
+    /// JS injected into the self-service page to click its "Install all" button and
+    /// confirm the resulting modal. The trigger button is labeled "Install all (N)"
+    /// (count in parentheses); clicking it opens a modal whose confirm button is
+    /// labeled exactly "Install all". Retries because the React UI mounts
+    /// asynchronously after `didFinish` and the modal appears a moment after the
+    /// trigger is clicked. Matching on visible button text keeps the install logic
+    /// owned by Fleet's UI rather than duplicated here. If the trigger is disabled
+    /// (nothing left to install) nothing happens, which is the desired outcome.
+    private static let installAllJS = """
+    (function() {
+        var attempts = 0;
+        var maxAttempts = 60; // ~30s at 500ms
+        var clickedTrigger = false;
+        function step() {
+            var btns = document.querySelectorAll('button');
+            if (!clickedTrigger) {
+                for (var i = 0; i < btns.length; i++) {
+                    var label = (btns[i].textContent || '').trim();
+                    // Trigger button: "Install all (N)" — has a count in parentheses.
+                    if (label.indexOf('Install all') === 0 && label.indexOf('(') !== -1 && !btns[i].disabled) {
+                        btns[i].click();
+                        clickedTrigger = true;
+                        break;
+                    }
+                }
+            } else {
+                for (var j = 0; j < btns.length; j++) {
+                    var confirmLabel = (btns[j].textContent || '').trim();
+                    // Modal confirm button: exactly "Install all" (no count).
+                    if (confirmLabel === 'Install all' && !btns[j].disabled) {
+                        btns[j].click();
+                        return;
+                    }
+                }
+            }
+            if (++attempts < maxAttempts) {
+                setTimeout(step, 500);
+            }
+        }
+        step();
+    })();
+    """
+
     // MARK: - Private
 
     /// Builds a device page URL from the base URL, current token, and page name.
     /// The token is percent-encoded to handle any special characters safely.
-    /// Defaults to "self-service" if no page is specified.
-    private func deviceURL(page: String = "self-service") -> URL? {
+    /// Defaults to "self-service" if no page is specified. When `categoryId` is
+    /// provided it is appended as ?category_id=## so the self-service page opens
+    /// filtered to that category (the value is validated as numeric upstream).
+    private func deviceURL(page: String = "self-service", categoryId: String? = nil) -> URL? {
         let (base, token): (String?, String?) = stateQueue.sync { (_baseURL, _currentToken) }
         guard let baseURL = base,
               let tok = token,
@@ -292,7 +399,12 @@ final class FleetService {
             return nil
         }
         let encodedPage = page.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? page
-        return URL(string: "\(baseURL)/device/\(encoded)/\(encodedPage)")
+        var urlString = "\(baseURL)/device/\(encoded)/\(encodedPage)"
+        if let categoryId = categoryId,
+           let encodedCategory = categoryId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            urlString += "?category_id=\(encodedCategory)"
+        }
+        return URL(string: urlString)
     }
 
     /// Reads config, creates the BrowserWindow, loads the URL, optionally shows the window,
@@ -310,21 +422,26 @@ final class FleetService {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
-            let (requestedPage, shouldRefetch, shouldUpdateAll): (String, Bool, Bool) = self.stateQueue.sync {
+            let (requestedPage, shouldRefetch, shouldUpdateAll, shouldInstallAll, installAllCategoryId): (String, Bool, Bool, Bool, String?) = self.stateQueue.sync {
                 let p = self._pendingPage ?? "self-service"
                 self._pendingPage = nil
                 let r = self._pendingRefetch
                 self._pendingRefetch = false
                 let u = self._pendingUpdateAll
                 self._pendingUpdateAll = false
-                return (p, r, u)
+                let i = self._pendingInstallAll
+                self._pendingInstallAll = false
+                let c = self._pendingInstallAllCategoryId
+                self._pendingInstallAllCategoryId = nil
+                return (p, r, u, i, c)
             }
             if shouldRefetch {
                 self.performRefetch()
             }
-            // Update-all requires the self-service page so the button is in the DOM.
-            let page = shouldUpdateAll ? "self-service" : requestedPage
-            guard let url = self.deviceURL(page: page) else {
+            // Update-all and install-all require the self-service page so the button is in the DOM.
+            let page = (shouldUpdateAll || shouldInstallAll) ? "self-service" : requestedPage
+            let categoryId = shouldInstallAll ? installAllCategoryId : nil
+            guard let url = self.deviceURL(page: page, categoryId: categoryId) else {
                 self.stateQueue.sync { self._isSettingUp = false }
                 self.showError("Unable to construct self-service URL. Check Fleet configuration.")
                 return
@@ -343,6 +460,8 @@ final class FleetService {
 
             if shouldUpdateAll {
                 browser.runOnNextLoad(Self.updateAllJS)
+            } else if shouldInstallAll {
+                browser.runOnNextLoad(Self.installAllJS)
             }
             browser.preload(url: url)
             self.startRefreshTimer()
