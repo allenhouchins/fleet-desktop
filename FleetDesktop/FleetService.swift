@@ -194,10 +194,10 @@ final class FleetService {
         }
 
         // fleet://install_all (or fleet://install-all) — open the self-service page
-        // and click its "Install all" button, then confirm the modal, via the WebView.
-        // An optional ?category_id=## first filters the page to that category so only
-        // that category's apps are installed, matching Fleet's own UI behavior. As with
-        // update_all, the install logic stays owned by Fleet's UI rather than duplicated.
+        // and click its "Install all" button via the WebView, which opens Fleet's
+        // confirmation modal. The user must explicitly confirm before anything
+        // installs. An optional ?category_id=## first filters the page to that
+        // category so the install is scoped to it, matching Fleet's own UI behavior.
         if host == "install_all" || host == "install-all" {
             let categoryId = Self.categoryID(from: url)
             let ready: Bool = stateQueue.sync {
@@ -328,9 +328,9 @@ final class FleetService {
     }
 
     /// Navigates to the self-service page (optionally filtered to a category) and
-    /// clicks its "Install all" button, then confirms the modal — reusing the Fleet
-    /// UI's own filter/install logic. Called when fleet://install_all arrives after
-    /// the browser has been set up.
+    /// clicks its "Install all" button, which opens Fleet's confirmation modal for
+    /// the user to accept — reusing the Fleet UI's own filter/install logic. Called
+    /// when fleet://install_all arrives after the browser has been set up.
     private func triggerInstallAll(categoryId: String?) {
         guard let target = deviceURL(page: "self-service", categoryId: categoryId),
               let browser = browserWindow else { return }
@@ -341,46 +341,35 @@ final class FleetService {
         }
     }
 
-    /// JS injected into the self-service page to click its "Install all" button and
-    /// confirm the resulting modal. The trigger button is labeled "Install all (N)"
-    /// (count in parentheses); clicking it opens a modal whose confirm button is
-    /// labeled exactly "Install all". Retries because the React UI mounts
-    /// asynchronously after `didFinish` and the modal appears a moment after the
-    /// trigger is clicked. Matching on visible button text keeps the install logic
-    /// owned by Fleet's UI rather than duplicated here. If the trigger is disabled
-    /// (nothing left to install) nothing happens, which is the desired outcome.
+    /// JS injected into the self-service page to click its "Install all" button.
+    /// The trigger button is labeled "Install all (N)" (count in parentheses);
+    /// clicking it opens Fleet's confirmation modal. We intentionally stop here —
+    /// the user must explicitly confirm in the modal before anything installs, so
+    /// the deep link never starts installs without acknowledgment. Retries because
+    /// the React UI mounts asynchronously after `didFinish`. Matching on visible
+    /// button text keeps the install logic owned by Fleet's UI rather than
+    /// duplicated here. If the trigger is disabled (nothing left to install)
+    /// nothing happens, which is the desired outcome.
     private static let installAllJS = """
     (function() {
         var attempts = 0;
         var maxAttempts = 60; // ~30s at 500ms
-        var clickedTrigger = false;
-        function step() {
+        function tryClick() {
             var btns = document.querySelectorAll('button');
-            if (!clickedTrigger) {
-                for (var i = 0; i < btns.length; i++) {
-                    var label = (btns[i].textContent || '').trim();
-                    // Trigger button: "Install all (N)" — has a count in parentheses.
-                    if (label.indexOf('Install all') === 0 && label.indexOf('(') !== -1 && !btns[i].disabled) {
-                        btns[i].click();
-                        clickedTrigger = true;
-                        break;
-                    }
-                }
-            } else {
-                for (var j = 0; j < btns.length; j++) {
-                    var confirmLabel = (btns[j].textContent || '').trim();
-                    // Modal confirm button: exactly "Install all" (no count).
-                    if (confirmLabel === 'Install all' && !btns[j].disabled) {
-                        btns[j].click();
-                        return;
-                    }
+            for (var i = 0; i < btns.length; i++) {
+                var label = (btns[i].textContent || '').trim();
+                // Trigger button: "Install all (N)" — has a count in parentheses.
+                // Clicking it opens the confirmation modal; the user confirms.
+                if (label.indexOf('Install all') === 0 && label.indexOf('(') !== -1 && !btns[i].disabled) {
+                    btns[i].click();
+                    return;
                 }
             }
             if (++attempts < maxAttempts) {
-                setTimeout(step, 500);
+                setTimeout(tryClick, 500);
             }
         }
-        step();
+        tryClick();
     })();
     """
 
