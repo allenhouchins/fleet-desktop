@@ -42,7 +42,9 @@ if [ ! -f "$MDM_PLIST" ]; then
 fi
 
 BUNDLE_ID="com.fleetdm.fleet-desktop"
-RUNNING_FLAG="/tmp/.fleet_desktop_was_running"
+# Root-only directory — /tmp is world-writable, so a flag there could be
+# symlink-attacked between install phases.
+RUNNING_FLAG="/var/db/.fleet_desktop_was_running"
 
 # Clean up any stale flag from a previous install
 rm -f "$RUNNING_FLAG"
@@ -89,7 +91,7 @@ cat > "$PKG_DIR/postinstall" << 'POSTINSTALL_EOF'
 
 APP_PATH="/Applications/Fleet Desktop.app"
 BUNDLE_ID="com.fleetdm.fleet-desktop"
-RUNNING_FLAG="/tmp/.fleet_desktop_was_running"
+RUNNING_FLAG="/var/db/.fleet_desktop_was_running"
 
 # Set ownership to root:admin
 chown -R root:admin "$APP_PATH"

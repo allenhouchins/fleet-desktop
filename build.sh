@@ -21,13 +21,18 @@ SOURCES=(
 SDK="$(xcrun --show-sdk-path)"
 SWIFT_FLAGS=(-sdk "$SDK" -parse-as-library -O)
 
-# Build for arm64
+# Build both architectures in parallel; wait on each PID so a failure in
+# either build fails the script (set -e applies to wait's exit status).
 swiftc -target arm64-apple-macos13 "${SWIFT_FLAGS[@]}" \
-    -o "$BUILD_DIR/FleetDesktop-arm64" "${SOURCES[@]}"
+    -o "$BUILD_DIR/FleetDesktop-arm64" "${SOURCES[@]}" &
+ARM64_PID=$!
 
-# Build for x86_64
 swiftc -target x86_64-apple-macos13 "${SWIFT_FLAGS[@]}" \
-    -o "$BUILD_DIR/FleetDesktop-x86_64" "${SOURCES[@]}"
+    -o "$BUILD_DIR/FleetDesktop-x86_64" "${SOURCES[@]}" &
+X86_64_PID=$!
+
+wait "$ARM64_PID"
+wait "$X86_64_PID"
 
 # Create universal binary
 lipo -create \
