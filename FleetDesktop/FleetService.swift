@@ -281,6 +281,9 @@ final class FleetService {
     private func triggerUpdateAll() {
         guard let target = deviceURL(page: "self-service"),
               let browser = browserWindow else { return }
+        // Mark the badge count as seen before reloading, so onWindowShow's
+        // staleness check doesn't reload the old page and cancel this navigation.
+        stateQueue.sync { _pageBadgeCount = _lastBadgeCount }
         DispatchQueue.main.async {
             browser.runOnNextLoad(Self.updateAllJS)
             browser.reload(url: target)
@@ -334,6 +337,9 @@ final class FleetService {
     private func triggerInstallAll(categoryId: String?) {
         guard let target = deviceURL(page: "self-service", categoryId: categoryId),
               let browser = browserWindow else { return }
+        // Mark the badge count as seen before reloading, so onWindowShow's
+        // staleness check doesn't reload the old page and cancel this navigation.
+        stateQueue.sync { _pageBadgeCount = _lastBadgeCount }
         DispatchQueue.main.async {
             browser.runOnNextLoad(Self.installAllJS)
             browser.reload(url: target)
