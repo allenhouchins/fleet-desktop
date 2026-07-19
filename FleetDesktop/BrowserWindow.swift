@@ -258,6 +258,13 @@ final class BrowserWindow: NSObject, NSWindowDelegate {
         ssoFlowStartedAt = nil
     }
 
+    /// Returns the WebView to the Fleet device page. Used to recover from a
+    /// stranded state (expired/abandoned SSO flow on an external page).
+    private func navigateHome() {
+        guard let homeURL = homeURL else { return }
+        webView?.load(URLRequest(url: homeURL))
+    }
+
     // MARK: - External URL Safety
 
     /// Opens a URL externally only if it uses a safe scheme (https, http, mailto).
@@ -427,8 +434,11 @@ extension BrowserWindow: WKNavigationDelegate {
         // arbitrary sites.
         if ssoFlowActive {
             guard requestURL.scheme?.lowercased() == "https", !ssoFlowExpired else {
+                // Flow over (expired or degraded to non-HTTPS). Don't just cancel —
+                // that would strand the WebView on the IdP page; return home.
                 resetSSOFlow()
                 decisionHandler(.cancel)
+                navigateHome()
                 return
             }
             if requestHost == ssoHost {
@@ -456,9 +466,16 @@ extension BrowserWindow: WKNavigationDelegate {
             }
         }
 
-        // External links — open in default browser (scheme-validated)
-        openExternalURL(requestURL)
+        // External links — open in default browser (scheme-validated). But if
+        // the WebView is stranded on an external page with no active flow (an
+        // expired or abandoned SSO), navigate home instead — otherwise every
+        // scripted retry on the stranded page would pop another browser tab.
         decisionHandler(.cancel)
+        if webView.url?.host?.lowercased() == fleetHost {
+            openExternalURL(requestURL)
+        } else {
+            navigateHome()
+        }
     }
 }
 
@@ -524,9 +541,7 @@ extension BrowserWindow: WKDownloadDelegate {
             NSWorkspace.shared.open(url)
 
             // Navigate back to the Fleet self-service homepage
-            if let homeURL = homeURL {
-                webView?.load(URLRequest(url: homeURL))
-            }
+            navigateHome()
         }
     }
 
