@@ -281,6 +281,9 @@ final class FleetService {
     private func triggerUpdateAll() {
         guard let target = deviceURL(page: "self-service"),
               let browser = browserWindow else { return }
+        // Mark the badge count as seen before reloading, so onWindowShow's
+        // staleness check doesn't reload the old page and cancel this navigation.
+        stateQueue.sync { _pageBadgeCount = _lastBadgeCount }
         DispatchQueue.main.async {
             browser.runOnNextLoad(Self.updateAllJS)
             browser.reload(url: target)
@@ -334,6 +337,9 @@ final class FleetService {
     private func triggerInstallAll(categoryId: String?) {
         guard let target = deviceURL(page: "self-service", categoryId: categoryId),
               let browser = browserWindow else { return }
+        // Mark the badge count as seen before reloading, so onWindowShow's
+        // staleness check doesn't reload the old page and cancel this navigation.
+        stateQueue.sync { _pageBadgeCount = _lastBadgeCount }
         DispatchQueue.main.async {
             browser.runOnNextLoad(Self.installAllJS)
             browser.reload(url: target)
@@ -495,6 +501,13 @@ final class FleetService {
     private func resolveConfig() -> Bool {
         guard let fleetURL = readFleetURL() else {
             showError("This app is currently only supported on MDM-enabled Macs. Please contact your administrator for assistance.")
+            return false
+        }
+
+        // Require HTTPS — the device token is sent to this URL, and a
+        // misconfigured http:// value would put it on the wire in cleartext.
+        guard let parsed = URL(string: fleetURL), parsed.scheme?.lowercased() == "https" else {
+            showError("The configured Fleet URL must use HTTPS.\nCheck the FleetURL managed preference.")
             return false
         }
 
@@ -677,8 +690,21 @@ final class FleetService {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Characters allowed in a device token (alphanumerics plus - and _).
+    /// Rejecting anything else keeps path separators and other URL
+    /// metacharacters out of the device URLs built from the token.
+    private static let tokenAllowedCharacters: CharacterSet = {
+        var set = CharacterSet.alphanumerics
+        set.insert(charactersIn: "-_")
+        return set
+    }()
+
     private func readToken() -> String? {
-        return readFileTrimmed(path: tokenFile)
+        guard let token = readFileTrimmed(path: tokenFile),
+              token.unicodeScalars.allSatisfy({ Self.tokenAllowedCharacters.contains($0) }) else {
+            return nil
+        }
+        return token
     }
 
     private func readFileTrimmed(path: String) -> String? {
